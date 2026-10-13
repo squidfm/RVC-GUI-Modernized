@@ -81,6 +81,35 @@ device = config.device
 print(device)
 is_half = config.is_half
 
+# ---- Max quality mode ----
+# Normal mode uses what config.py picked for this GPU (fp16 + 60 s chunks on an RTX 3060).
+# Max quality forces full precision, more context around each chunk and bigger chunks.
+from vc_infer_pipeline import MAX_QUALITY_CHUNKS, MAX_QUALITY_NPROBE
+DEFAULT_CFG = (config.is_half, config.x_pad, config.x_query, config.x_center, config.x_max)
+current_max_quality = None
+
+
+def apply_quality_mode(max_q):
+    global current_max_quality, is_half
+    if max_q == current_max_quality:
+        return
+    if max_q:
+        config.is_half = False
+        config.x_pad, config.x_query, config.x_center, config.x_max = MAX_QUALITY_CHUNKS
+    else:
+        (config.is_half, config.x_pad, config.x_query,
+         config.x_center, config.x_max) = DEFAULT_CFG
+    if "cpu" in str(config.device):
+        config.is_half = False
+    is_half = config.is_half
+    first_time = current_max_quality is None
+    current_max_quality = max_q
+    print("Quality mode: %s (%s)" % ("MAX" if max_q else "normal", "fp16" if is_half else "fp32"))
+    if not first_time and "pth_file_path" in globals():
+        if hubert_model is not None:
+            load_hubert()
+        get_vc(pth_file_path, 0)
+
 def load_hubert():
     global hubert_model
     models, _, _ = checkpoint_utils.load_model_ensemble_and_task(
@@ -341,13 +370,10 @@ def get_output_path(file_path):
 
     # Increment index until a new file path is found
     while True:
-        new_dir = f"{dir_name}\\{chosenOne}\\"
         new_file_name = f"{file_name}_RVC_{index}{file_ext}"
-        new_file_path = os.path.join(new_dir, new_file_name)
+        new_file_path = os.path.join(dir_name, new_file_name)
         if not os.path.exists(new_file_path):
             # change the file extension to .wav
-            if not os.path.exists(new_dir):
-                os.makedirs(new_dir)
             new_file_path = os.path.splitext(new_file_path)[0] + ".wav"
             return new_file_path  # Found new file path, return it
         index += 1
@@ -376,7 +402,20 @@ def on_button_click():
         try:
             loading_frame.pack(padx=10, pady=10)
             loading_progress.start()
-            
+            max_q = max_quality_var.get()
+            apply_quality_mode(max_q)  # reloads the models if the precision changed
+            vc.octave_fix = "down" if octave_fix_var.get() else "off"
+            vc.index_nprobe = MAX_QUALITY_NPROBE if max_q else 1
+            vc.protect = round(protect_entry.get(), 2)
+            vc.rms_mix_rate = round(rms_mix_entry.get(), 2)
+            if max_q:
+                if f0_method == "rmvpe":
+                    f0_method = "hybrid"  # RMVPE + crepe, merged
+                elif f0_method in ("crepe", "crepe-tiny"):
+                    crepe_hop_length = min(crepe_hop_length, 64)
+            print("Quality: %s | method: %s | protect: %s | volume envelope: %s | index nprobe: %s"
+                  % ("MAX" if max_q else "normal", f0_method, vc.protect, vc.rms_mix_rate, vc.index_nprobe))
+
             result, audio_opt = vc_single(
                 0, input_audio, f0_pitch, None, f0_method, file_index, index_rate,crepe_hop_length, output_file)
             # output_label.configure(text=result + "\n saved at" + output_file)
@@ -414,7 +453,7 @@ def on_button_click():
 
 def browse_file():
     filepath = filedialog.askopenfilename (
-        filetypes=[("Audio Files", ["*.mp3","*.wav"])])
+        filetypes=[("Audio Files", ["*.wav", "*.mp3", "*.flac", "*.ogg", "*.m4a"]), ("All files", "*.*")])
     filepath = os.path.normpath(filepath)  # Normalize file path
     input_audio_entry.delete(0, tk.END)
     input_audio_entry.insert(0, filepath)
@@ -438,16 +477,15 @@ screen_height = root.winfo_screenheight()
 # Set GUI dimensions as a percentage of screen size
 
 gui_height = int(screen_height * 0.85)  # 80% of screen height
-gui_dimensions = f"800x{gui_height}"
+gui_dimensions = f"900x{gui_height}"
 
 root.geometry(gui_dimensions)
-root.resizable(False, True)
+root.resizable(True, True)
 
 model_loaded = False
 
+
 def selected_model(choice):
-    global chosenOne
-    chosenOne = choice
     file_index_entry.delete(0, ctk.END)
     model_dir = os.path.join(models_dir, choice)
     pth_files = [f for f in os.listdir(model_dir) if os.path.isfile(os.path.join(model_dir, f)) 
@@ -595,8 +633,18 @@ crepe_hop_length_entry.set(2)
 f0_method_label = ctk.CTkLabel(
     pitch_frame, text="F0 method")
 f0_method_entry = ctk.CTkSegmentedButton(
-    pitch_frame, height=40, values=["dio", "pm","harvest", "crepe", "crepe-tiny" ], command=crepe_hop_length_slider_visibility)
-f0_method_entry.set("dio")
+    pitch_frame, height=40, values=["rmvpe", "dio", "pm","harvest", "crepe", "crepe-tiny" ], command=crepe_hop_length_slider_visibility)
+f0_method_entry.set("rmvpe")
+
+# Octave guard: repairs stretches where the pitch tracker dropped an octave
+octave_fix_var = ctk.BooleanVar(value=True)
+octave_fix_checkbox = ctk.CTkCheckBox(
+    pitch_frame, text="Fix octave drops", variable=octave_fix_var)
+
+# Max quality: fp32, RMVPE+crepe pitch, wider index search, bigger chunks (slower)
+max_quality_var = ctk.BooleanVar(value=True)
+max_quality_checkbox = ctk.CTkCheckBox(
+    pitch_frame, text="Max quality (slower)", variable=max_quality_var)
 
 # intiilizing index file widget
 file_index_label = ctk.CTkLabel(right_frame, text=".index File (Recommended)")
@@ -613,6 +661,22 @@ index_rate_entry.set(0.4)
 index_rate_label = ctk.CTkLabel(
     right_frame, text="Feature retrieval rate: 0.4" )
 
+# Protect breaths/consonants: 0.5 = off, lower = more of the source kept on unvoiced sounds
+protect_label = ctk.CTkLabel(right_frame, text="Protect consonants/breaths: 0.33")
+protect_entry = ctk.CTkSlider(
+    right_frame, from_=0, to=0.5, number_of_steps=50,
+    command=lambda v: protect_label.configure(
+        text="Protect consonants/breaths: %s" % ("off" if v >= 0.5 else round(v, 2))))
+protect_entry.set(0.33)
+
+# Volume envelope: 1 = converted output's own loudness, lower = follow the input's dynamics
+rms_mix_label = ctk.CTkLabel(right_frame, text="Volume envelope mix: 1.0 (off)")
+rms_mix_entry = ctk.CTkSlider(
+    right_frame, from_=0, to=1, number_of_steps=20,
+    command=lambda v: rms_mix_label.configure(
+        text="Volume envelope mix: %s" % ("1.0 (off)" if v >= 1 else round(v, 2))))
+rms_mix_entry.set(1)
+
 # intiilizing run button widget
 run_button = ctk.CTkButton(
     left_frame, fg_color="green", hover_color="darkgreen", text="Convert", command=start_processing)
@@ -621,7 +685,7 @@ run_button = ctk.CTkButton(
 output_label = ctk.CTkLabel(right_frame, text="")
 
 # intiilizing Notes label widget
-notes_label = ctk.CTkLabel(left_frame, justify="left", text_color="#8A8A8A", text="Tips: \n 1. harvest and crepe are the highest quality, but also the slowest methods. \n 2. dio and pm are the lightest and fastest methods, but also the lowest quality.")
+notes_label = ctk.CTkLabel(master_frame, justify="left", text_color="#8A8A8A", text="Tips: \n 1. rmvpe is the most reliable method (fewest octave jumps). \n 2. harvest and crepe are good but slow; dio and pm are fast but prone to octave errors.")
 
 # intiilizing loading progress bar widget
 
@@ -667,7 +731,7 @@ import_moodels_button = ctk.CTkButton(right_frame, fg_color="darkred", hover_col
 
 
 # Packing widgets into window
-notes_label.grid(row=5, column=0, padx=10, pady=10)
+notes_label.grid(row=1, column=0, columnspan=2, padx=10, pady=(0, 10), sticky="w")
 change_device_label.grid(row=1, column=0, columnspan=2, padx=10, pady=5)
 change_device.grid(row=2, column=0, columnspan=2, padx=10, pady=5)
 last_output_label.grid( pady=10, row=0, column=0)
@@ -686,6 +750,8 @@ f0_method_entry.grid(padx=10, pady=10, row=0, column=1)
 #crepe_hop_length_entry.grid(padx=10, pady=10, row=1, column=1)
 f0_pitch_label.grid(padx=10, pady=10, row=3, column=0)
 f0_pitch_entry.grid(padx=10, pady=10, row=3, column=1)
+octave_fix_checkbox.grid(padx=10, pady=5, row=4, column=0)
+max_quality_checkbox.grid(padx=10, pady=5, row=4, column=1)
 #0_file_label.grid(padx=10, pady=10)
 #f0_file_entry.grid(padx=10, pady=10)
 file_index_label.grid(padx=10, pady=10)
@@ -696,5 +762,16 @@ index_rate_label.grid(padx=10, pady=10)
 index_rate_entry.grid(padx=10, pady=10)
 run_button.grid(padx=30, pady=30, row=4, column=0, columnspan=2)
 output_label.grid(padx=0, pady=10)
+protect_label.grid(padx=10, pady=(10, 0))
+protect_entry.grid(padx=10, pady=10)
+rms_mix_label.grid(padx=10, pady=(10, 0))
+rms_mix_entry.grid(padx=10, pady=10)
+
+apply_quality_mode(max_quality_var.get())  # set precision before any model is loaded
+
+# Let the window size itself to fit all widgets (a fixed size cut off the right panel
+# on some display-scaling settings). It still grows when the output panel appears.
+root.update_idletasks()
+tk.Tk.geometry(root, "")
 
 root.mainloop()

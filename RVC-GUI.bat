@@ -11,7 +11,7 @@ REM Check if the runtime folder exists
 REM Check if the runtime folder exists
 if exist "%runtimeFolder%\python.exe" (
     REM Runtime folder exists, so run the file using the runtime Python
-    echo Running with the runtime Python.
+    echo Running with the runtime Python, Please wait.
      "runtime/python.exe" rvcgui.py --pycmd "runtime/python.exe"
       pause
 ) else (
