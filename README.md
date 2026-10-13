@@ -1,7 +1,5 @@
 ## What's new in the GUI
 
-Everything is in place — close and restart the GUI to load it.
-
 * **“Max quality (slower)”** checkbox, on by default. It does four things:
   * Runs everything in full precision.
   * Merges the RMVPE and crepe pitch trackers. Where they agree, it averages them for steadier pitch. Where one slips an octave, it takes the one that fits the surrounding pitch.
